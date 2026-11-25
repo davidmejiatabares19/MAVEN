@@ -1,29 +1,21 @@
 pipeline {
     agent any
-
     triggers { pollSCM('H/5 * * * *') }
-    options {
-        skipDefaultCheckout(true)
-        timestamps()
-        disableConcurrentBuilds()
-    }
-
+    options { skipDefaultCheckout(true); timestamps(); disableConcurrentBuilds() }
     environment {
         SONAR_PROJECT_KEY = 'clientes-web'
+        JAVA_HOME = 'C:/Program Files/Java/jdk-21.0.12.1'
         APP_URL = 'http://127.0.0.1:8081/'
         TOMCAT_URL = 'http://127.0.0.1:8090/clientes/'
         TOMCAT_BASE = 'D:/INSTALADORES/TOMCAT'
     }
-
     stages {
         stage('Revisar main') {
             steps {
-                checkout([$class: 'GitSCM', branches: [[name: '*/main']],
-                    userRemoteConfigs: [[url: 'https://github.com/davidmejiatabares19/MAVEN.git']]])
+                checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[url: 'https://github.com/davidmejiatabares19/MAVEN.git']]])
                 echo 'Código de la rama main descargado.'
             }
         }
-
         stage('Compilar y analizar con SonarQube') {
             steps {
                 script {
@@ -38,16 +30,13 @@ pipeline {
                 }
             }
         }
-
         stage('Quality Gate SonarQube') {
             steps {
                 script {
                     try {
                         timeout(time: 5, unit: 'MINUTES') {
                             def qualityGate = waitForQualityGate()
-                            if (qualityGate.status != 'OK') {
-                                error "Quality Gate: ${qualityGate.status}"
-                            }
+                            if (qualityGate.status != 'OK') { error('Quality Gate: ' + qualityGate.status) }
                         }
                         echo 'El código cumple con SonarQube (Quality Gate OK).'
                     } catch (err) {
@@ -57,26 +46,37 @@ pipeline {
                 }
             }
         }
-
         stage('Iniciar aplicación para las pruebas') {
             steps {
                 writeFile file: 'start-app.ps1', text: '''
-$jar = Join-Path $PWD 'target/clientes-web-1.0.0.war'
-$process = Start-Process -FilePath 'java.exe' -ArgumentList @('-jar', $jar, '--server.port=8081') -PassThru -WindowStyle Hidden
+$ErrorActionPreference = 'Stop'
+$java = Join-Path $env:JAVA_HOME 'bin/java.exe'
+$war = Join-Path $PWD 'target/clientes-web-1.0.0.war'
+if (-not (Test-Path $java)) { throw "No se encontró Java 21 en: $java" }
+if (-not (Test-Path $war)) { throw "No se encontró el WAR: $war" }
+Remove-Item app-test.log, app-test-error.log -Force -ErrorAction SilentlyContinue
+$process = Start-Process -FilePath $java -ArgumentList @('-jar', $war, '--server.port=8081') -PassThru -WindowStyle Hidden -RedirectStandardOutput 'app-test.log' -RedirectStandardError 'app-test-error.log'
 Set-Content -Path 'app.pid' -Value $process.Id
 '''
                 bat 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File start-app.ps1'
                 writeFile file: 'wait-app.ps1', text: '''
 $ready = $false
-for ($i = 0; $i -lt 40; $i++) {
-  try { $r = Invoke-WebRequest -Uri $env:APP_URL -UseBasicParsing -TimeoutSec 3; if ($r.StatusCode -eq 200) { $ready = $true; break } } catch { Start-Sleep -Seconds 2 }
+for ($i = 0; $i -lt 60; $i++) {
+  $processId = [int](Get-Content app.pid)
+  if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { break }
+  try { $r = Invoke-WebRequest -Uri $env:APP_URL -UseBasicParsing -TimeoutSec 2; if ($r.StatusCode -eq 200) { $ready = $true; break } } catch { }
+  Start-Sleep -Seconds 1
 }
-if (-not $ready) { Write-Error 'La aplicación no inició en el puerto 8081'; exit 1 }
+if (-not $ready) {
+  Write-Output 'La aplicación no inició; últimas líneas de salida:'
+  Get-Content app-test.log, app-test-error.log -Tail 40 -ErrorAction SilentlyContinue
+  Write-Error 'La aplicación no inició en el puerto 8081'
+  exit 1
+}
 '''
                 bat 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File wait-app.ps1'
             }
         }
-
         stage('Pruebas Robot Framework') {
             steps {
                 script {
@@ -91,7 +91,6 @@ if (-not $ready) { Write-Error 'La aplicación no inició en el puerto 8081'; ex
                 }
             }
         }
-
         stage('Desplegar en Tomcat 10') {
             steps {
                 writeFile file: 'deploy-tomcat.ps1', text: '''
@@ -100,7 +99,7 @@ $base = $env:TOMCAT_BASE
 $appBase = Join-Path $base 'webapps'
 if (-not (Test-Path $appBase)) { throw "No se encontró el appBase de Tomcat: $appBase" }
 Copy-Item 'target/clientes-web-1.0.0.war' (Join-Path $appBase 'clientes.war') -Force
-Write-Output 'WAR Jakarta copiado al appBase de Tomcat.'
+Write-Output 'WAR copiado al appBase de Tomcat.'
 $ready = $false
 for ($i = 0; $i -lt 40; $i++) {
   try { $r = Invoke-WebRequest -Uri $env:TOMCAT_URL -UseBasicParsing -TimeoutSec 3; if ($r.StatusCode -eq 200) { $ready = $true; break } } catch { Start-Sleep -Seconds 2 }
@@ -112,10 +111,18 @@ Write-Output "Aplicación desplegada: $env:TOMCAT_URL"
             }
         }
     }
-
     post {
         always {
-            bat 'powershell.exe -NoProfile -Command "if (Test-Path app.pid) { Stop-Process -Id (Get-Content app.pid) -Force -ErrorAction SilentlyContinue }"'
+            writeFile file: 'cleanup-app.ps1', text: '''
+try {
+  if (Test-Path -LiteralPath 'app.pid') {
+    $processId = [int](Get-Content -LiteralPath 'app.pid')
+    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+  }
+} catch { }
+exit 0
+'''
+            bat 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File cleanup-app.ps1'
         }
     }
 }
