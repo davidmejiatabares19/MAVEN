@@ -1,0 +1,4 @@
+com\ejemplo\clientes\ClienteController.class
+com\ejemplo\clientes\ClienteService.class
+com\ejemplo\clientes\Cliente.class
+com\ejemplo\clientes\ClientesApplication.class
